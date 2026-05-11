@@ -1,0 +1,23 @@
+# Data files
+data/
+delta_lake/
+output/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
