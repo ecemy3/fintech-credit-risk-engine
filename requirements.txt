@@ -1,0 +1,20 @@
+# Kafka Producer
+kafka-python==2.0.2
+pandas==2.1.4
+python-dotenv==1.0.0
+
+# Spark & Delta Lake
+pyspark==3.5.0
+delta-spark==3.0.0
+
+# ML & MLflow
+mlflow==2.9.2
+scikit-learn==1.3.2
+
+# Görselleştirme
+matplotlib==3.8.2
+seaborn==0.13.0
+
+# Notebook
+jupyter==1.0.0
+ipykernel==6.27.1
