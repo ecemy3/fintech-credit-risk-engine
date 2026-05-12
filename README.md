@@ -117,6 +117,7 @@ make clean-docker  # Docker container/image'larını temizle
 - `notebooks/step5_feature_engineering.ipynb` — Feature Engineering
 - `notebooks/step6_ml_mlflow.ipynb` — ML Modelleri
 - `notebooks/step7_dashboard.ipynb` — Dashboard
+- `README_STEP4_STEP5.md` — Step 4 ve Step 5 icin detayli calistirma ve teslim rehberi
 
 ## Klasör Yapısı
 
