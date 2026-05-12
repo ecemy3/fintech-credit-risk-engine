@@ -1,0 +1,8 @@
+kpi,value
+Total Loans,271765
+Default Rate,0.21195150221698894
+Best Model,GBTClassifier
+Best AUC,0.7125159146189081
+Avg Interest Rate,13.286736592277219
+Recommended Threshold (Cost),0.4
+Recommended Threshold (F1),0.5

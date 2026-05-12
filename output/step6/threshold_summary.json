@@ -1,0 +1,12 @@
+{
+  "model": "GBTClassifier",
+  "score_min": 0.017592677087206687,
+  "score_max": 0.9699534380944467,
+  "uses_sigmoid_calibration": false,
+  "best_threshold_by_cost": 0.4,
+  "best_threshold_by_f1": 0.5,
+  "f1_at_best_cost": 0.428311912439257,
+  "recall_at_best_cost": 0.8180241131060804,
+  "precision_at_best_cost": 0.29010427881509737,
+  "expected_cost_at_best_cost": 33568.0
+}
