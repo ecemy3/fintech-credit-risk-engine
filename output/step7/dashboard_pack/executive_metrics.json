@@ -1,0 +1,11 @@
+{
+  "total_loans": 271765,
+  "default_rate": 0.21195150221698894,
+  "best_model": "GBTClassifier",
+  "best_auc": 0.7125159146189081,
+  "avg_interest_rate": 13.286736592277219,
+  "recommended_threshold_cost": 0.4,
+  "recommended_threshold_f1": 0.5,
+  "fp_cost_base": 1.0,
+  "fn_cost_base": 5.0
+}

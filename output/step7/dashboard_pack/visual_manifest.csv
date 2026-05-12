@@ -1,0 +1,14 @@
+page,visual,dataset
+Executive Overview,KPI Cards,kpi_cards.csv
+Executive Overview,Loan Status Pie,loan_status_distribution.csv
+EDA Dashboard,Income Histogram,gold feature sample in notebook
+EDA Dashboard,Monthly Default Trend,monthly_default_trend.csv
+EDA Dashboard,FICO Risk Line,fico_default_risk.csv
+EDA Dashboard,Home Ownership Risk,home_ownership_risk.csv
+EDA Dashboard,Loan Purpose Risk,loan_purpose_risk.csv
+ML Dashboard,Model Metrics Grouped Bar,model_metrics_long.csv
+ML Dashboard,Feature Importance,feature_importance_rf.csv or feature_importance_gbt.csv
+ML Dashboard,Confusion Matrix,confusion_matrix_best.csv
+ML Dashboard,ROC Curve,roc_curve_best.csv
+Threshold Strategy,Threshold vs Metrics,threshold_tuning_best_model.csv
+Threshold Strategy,Business Cost Matrix,business_cost_matrix.csv
