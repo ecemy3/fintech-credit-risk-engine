@@ -67,38 +67,45 @@ def build_message(row: pd.Series) -> dict:
     }
 
 
+CHUNK_SIZE = 5_000
+
+
 def main():
     logger.info(f"Veri dosyası okunuyor: {DATA_FILE}")
 
-    try:
-        df = pd.read_csv(DATA_FILE, usecols=lambda c: c in COLUMNS, low_memory=False)
-    except FileNotFoundError:
+    if not os.path.exists(DATA_FILE):
         logger.error(f"Veri dosyası bulunamadı: {DATA_FILE}")
-        raise
-
-    logger.info(f"Toplam kayıt sayısı: {len(df):,}")
+        raise FileNotFoundError(DATA_FILE)
 
     producer = wait_for_kafka()
     delay = 1.0 / MSG_PER_SECOND
 
     sent = 0
-    for _, row in df.iterrows():
-        message = build_message(row)
-        producer.send(
-            KAFKA_TOPIC,
-            value=json.dumps(message).encode("utf-8"),
-            key=str(message["loan_id"]).encode("utf-8")
+    while True:
+        reader = pd.read_csv(
+            DATA_FILE,
+            usecols=lambda c: c in COLUMNS,
+            low_memory=False,
+            chunksize=CHUNK_SIZE,
         )
-        sent += 1
+        for chunk in reader:
+            for _, row in chunk.iterrows():
+                message = build_message(row)
+                producer.send(
+                    KAFKA_TOPIC,
+                    value=json.dumps(message).encode("utf-8"),
+                    key=str(message["loan_id"]).encode("utf-8"),
+                )
+                sent += 1
 
-        if sent % 1000 == 0:
-            producer.flush()
-            logger.info(f"Gönderilen mesaj: {sent:,} / {len(df):,}")
+                if sent % 1000 == 0:
+                    producer.flush()
+                    logger.info(f"Gönderilen mesaj: {sent:,}")
 
-        time.sleep(delay)
+                time.sleep(delay)
 
-    producer.flush()
-    logger.info(f"Tamamlandı. Toplam gönderilen: {sent:,} mesaj.")
+        producer.flush()
+        logger.info(f"Dosya tamamlandı ({sent:,} mesaj). Baştan başlıyor...")
 
 
 if __name__ == "__main__":

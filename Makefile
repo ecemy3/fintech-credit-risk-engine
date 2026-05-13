@@ -28,6 +28,12 @@ restart:
 streaming:
 	docker exec spark python /app/spark/streaming_job.py
 
+# Jupyter Notebook sunucusunu baslat (http://localhost:8888)
+jupyter:
+	docker exec spark pip install jupyter notebook -q
+	docker exec -d spark jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' --notebook-dir=/app/notebooks
+	@echo "Jupyter hazir: http://localhost:8888"
+
 # Tüm container loglarını göster
 logs:
 	docker-compose logs -f

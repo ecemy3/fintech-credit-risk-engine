@@ -77,6 +77,7 @@ services:
       - ./mlruns:/app/mlruns
     ports:
       - "4040:4040"
+      - "8888:8888"
     networks:
       - bigdata-net
 
