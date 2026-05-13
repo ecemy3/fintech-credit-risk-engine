@@ -115,9 +115,11 @@ make clean-docker  # Docker container/image'larını temizle
 - `notebooks/step3_spark_streaming.ipynb` — Spark Streaming + Delta Lake (Bronze/Silver/Gold)
 - `notebooks/step4_eda.ipynb` — EDA
 - `notebooks/step5_feature_engineering.ipynb` — Feature Engineering
-- `notebooks/step6_ml_mlflow.ipynb` — ML Modelleri
-- `notebooks/step7_dashboard.ipynb` — Dashboard
+- `notebooks/step6_ml_models.ipynb` — ML Modelleri + MLflow takip
+- `notebooks/step7_dashboard_export.ipynb` — Dashboard + Power BI export
 - `README_STEP4_STEP5.md` — Step 4 ve Step 5 icin detayli calistirma ve teslim rehberi
+- `README_STEP6_STEP7.md` — Step 6 ve Step 7 icin detayli calistirma, iyilestirme ve Docker stabilite rehberi
+- `README_STREAMLIT_DASHBOARD.md` — Streamlit arayuzu icin detayli kullanim ve sunum rehberi
 
 ## Klasör Yapısı
 
