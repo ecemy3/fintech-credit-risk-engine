@@ -119,6 +119,7 @@ make clean-docker  # Docker container/image'larını temizle
 - `notebooks/step7_dashboard_export.ipynb` — Dashboard + Power BI export
 - `README_STEP4_STEP5.md` — Step 4 ve Step 5 icin detayli calistirma ve teslim rehberi
 - `README_STEP6_STEP7.md` — Step 6 ve Step 7 icin detayli calistirma, iyilestirme ve Docker stabilite rehberi
+- `README_STREAMLIT_DASHBOARD.md` — Streamlit arayuzu icin detayli kullanim ve sunum rehberi
 
 ## Klasör Yapısı
 
