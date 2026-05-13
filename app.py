@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -219,12 +220,76 @@ def get_missing_files(base_dir: Path) -> List[str]:
     return missing
 
 
+def normalize_model_key(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+
+def infer_model_name_from_feature_file(file_name: str, model_lookup: Dict[str, str]) -> str:
+    token = Path(file_name).stem
+    if token.startswith("feature_importance_"):
+        token = token[len("feature_importance_") :]
+
+    token_key = normalize_model_key(token)
+    token_key = {
+        "rf": "randomforestclassifier",
+        "gbt": "gbtclassifier",
+    }.get(token_key, token_key)
+
+    if token_key in model_lookup:
+        return model_lookup[token_key]
+
+    for normalized, model_name in model_lookup.items():
+        if token_key and (token_key in normalized or normalized in token_key):
+            return model_name
+
+    return token
+
+
+def get_feature_importance_source_files(base_dir: Path) -> List[Path]:
+    candidate_dirs = [base_dir]
+
+    # If dashboard data is loaded from step7 pack, also pull richer model-level
+    # feature importance exports from output/step6 when present.
+    if base_dir.name == "dashboard_pack" and base_dir.parent.name == "step7":
+        step6_dir = base_dir.parent.parent / "step6"
+        if step6_dir.exists() and step6_dir.is_dir():
+            candidate_dirs.append(step6_dir)
+
+    resolved: Dict[str, Path] = {}
+    for directory in candidate_dirs:
+        for csv_path in sorted(directory.glob("feature_importance_*.csv")):
+            # Prefer later directories for duplicate file names.
+            resolved[csv_path.name] = csv_path
+
+    return list(resolved.values())
+
+
 @st.cache_data(show_spinner=False)
 def load_dashboard_data(base_dir: str) -> Dict[str, pd.DataFrame]:
     root = Path(base_dir)
     data_frames: Dict[str, pd.DataFrame] = {}
     for filename in REQUIRED_FILES:
         data_frames[Path(filename).stem] = pd.read_csv(root / filename)
+
+    fi_frames: List[pd.DataFrame] = []
+    for csv_path in get_feature_importance_source_files(root):
+        try:
+            fi_df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+
+        if "feature" not in fi_df.columns or "importance" not in fi_df.columns:
+            continue
+
+        fi_subset = fi_df[["feature", "importance"]].copy()
+        fi_subset["source_file"] = csv_path.name
+        fi_frames.append(fi_subset)
+
+    if fi_frames:
+        data_frames["feature_importance_all_raw"] = pd.concat(fi_frames, ignore_index=True)
+    else:
+        data_frames["feature_importance_all_raw"] = pd.DataFrame(columns=["feature", "importance", "source_file"])
+
     return data_frames
 
 
@@ -247,14 +312,52 @@ def load_raw_eda_data(raw_path: str) -> pd.DataFrame:
         "emp_length",
     ]
 
-    try:
-        raw_df = pd.read_csv(raw_path, usecols=wanted_cols, low_memory=False)
-    except ValueError:
-        raw_all = pd.read_csv(raw_path, low_memory=False)
-        available_cols = [col for col in wanted_cols if col in raw_all.columns]
-        raw_df = raw_all[available_cols].copy()
+    header_df = pd.read_csv(raw_path, nrows=0)
+    available_cols = [col for col in wanted_cols if col in header_df.columns]
+    if not available_cols:
+        return pd.DataFrame()
 
-    return raw_df
+    # Keep raw EDA memory-safe in Streamlit by loading only a bounded sample.
+    chunk_size = 50_000
+    max_rows = 250_000
+
+    def _collect_chunks(engine: Optional[str] = None) -> pd.DataFrame:
+        read_kwargs: Dict[str, object] = {
+            "usecols": available_cols,
+            "chunksize": chunk_size,
+            "low_memory": True,
+            "on_bad_lines": "skip",
+        }
+        if engine:
+            read_kwargs["engine"] = engine
+
+        chunks: List[pd.DataFrame] = []
+        loaded_rows = 0
+
+        for chunk in pd.read_csv(raw_path, **read_kwargs):
+            remaining = max_rows - loaded_rows
+            if remaining <= 0:
+                break
+
+            if len(chunk) > remaining:
+                chunk = chunk.iloc[:remaining].copy()
+
+            chunks.append(chunk)
+            loaded_rows += len(chunk)
+
+            if loaded_rows >= max_rows:
+                break
+
+        if not chunks:
+            return pd.DataFrame(columns=available_cols)
+
+        return pd.concat(chunks, ignore_index=True)
+
+    try:
+        return _collect_chunks()
+    except pd.errors.ParserError:
+        # Fall back to the Python engine for malformed/oversized CSV rows.
+        return _collect_chunks(engine="python")
 
 
 def to_numeric(df: pd.DataFrame, columns: List[str]) -> None:
@@ -275,6 +378,51 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
 
     fi_rf = data["feature_importance_rf"].copy()
     to_numeric(fi_rf, ["importance"])
+
+    fi_all_raw = data.get("feature_importance_all_raw", pd.DataFrame()).copy()
+    if not fi_all_raw.empty:
+        to_numeric(fi_all_raw, ["importance"])
+
+    model_lookup = {
+        normalize_model_key(model): str(model)
+        for model in model_comparison["model"].dropna().astype(str).drop_duplicates().tolist()
+    }
+
+    fi_all_frames: List[pd.DataFrame] = []
+    if not fi_all_raw.empty and {"feature", "importance", "source_file"}.issubset(fi_all_raw.columns):
+        for source_file, source_df in fi_all_raw.groupby("source_file", dropna=False):
+            mapped_model = infer_model_name_from_feature_file(str(source_file), model_lookup)
+            feature_df = source_df[["feature", "importance"]].copy().dropna(subset=["feature", "importance"])
+            if feature_df.empty:
+                continue
+            feature_df["model"] = mapped_model
+            fi_all_frames.append(feature_df)
+
+    if not fi_all_frames:
+        fallback_sources = [
+            ("GBTClassifier", fi_gbt),
+            ("RandomForestClassifier", fi_rf),
+        ]
+        for model_name, source_df in fallback_sources:
+            feature_df = source_df[["feature", "importance"]].copy().dropna(subset=["feature", "importance"])
+            if feature_df.empty:
+                continue
+            feature_df["model"] = model_name
+            fi_all_frames.append(feature_df)
+
+    if fi_all_frames:
+        fi_all = pd.concat(fi_all_frames, ignore_index=True)
+        fi_all = (
+            fi_all.groupby(["model", "feature"], as_index=False)["importance"]
+            .mean()
+            .sort_values(["model", "importance"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+        importance_sum = fi_all.groupby("model")["importance"].transform("sum")
+        fi_all["importance_norm"] = np.where(importance_sum > 0, fi_all["importance"] / importance_sum, 0.0)
+        fi_all["rank"] = fi_all.groupby("model").cumcount() + 1
+    else:
+        fi_all = pd.DataFrame(columns=["model", "feature", "importance", "importance_norm", "rank"])
 
     confusion = data["confusion_matrix_best"].copy()
     to_numeric(confusion, ["label", "prediction", "count"])
@@ -339,6 +487,7 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         "model_metrics_long": metrics_long,
         "feature_importance_gbt": fi_gbt,
         "feature_importance_rf": fi_rf,
+        "feature_importance_all_models": fi_all,
         "confusion_matrix_best": confusion,
         "roc_curve_best": roc,
         "threshold_tuning_best_model": threshold,
@@ -350,6 +499,358 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         "home_ownership_risk": home,
         "loan_purpose_risk": purpose,
     }
+
+
+def parse_simple_meta_yaml(file_path: Path) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    if not file_path.exists() or not file_path.is_file():
+        return parsed
+
+    lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parsed[key.strip()] = value.strip().strip("\"").strip("'")
+    return parsed
+
+
+def load_mlflow_text_directory(directory: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not directory.exists() or not directory.is_dir():
+        return values
+
+    for child in sorted(directory.iterdir(), key=lambda p: p.name):
+        if not child.is_file():
+            continue
+        values[child.name] = child.read_text(encoding="utf-8", errors="ignore").strip()
+    return values
+
+
+def parse_mlflow_metric_file(metric_path: Path) -> Tuple[Optional[float], Optional[int], Optional[pd.Timestamp]]:
+    if not metric_path.exists() or not metric_path.is_file():
+        return None, None, None
+
+    lines = [line.strip() for line in metric_path.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()]
+    if not lines:
+        return None, None, None
+
+    parts = lines[-1].split()
+    if len(parts) < 2:
+        return None, None, None
+
+    try:
+        timestamp_raw = int(float(parts[0]))
+        value = float(parts[1])
+        step = int(float(parts[2])) if len(parts) > 2 else None
+        timestamp = pd.to_datetime(timestamp_raw, unit="ms", errors="coerce")
+    except (TypeError, ValueError):
+        return None, None, None
+
+    if pd.isna(timestamp):
+        return value, step, None
+    return value, step, timestamp
+
+
+def parse_mlflow_model_history_tag(raw_text: str) -> Dict[str, object]:
+    if not raw_text:
+        return {}
+
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {}
+
+    if isinstance(payload, list) and payload:
+        record = payload[-1]
+    elif isinstance(payload, dict):
+        record = payload
+    else:
+        return {}
+
+    if not isinstance(record, dict):
+        return {}
+
+    flavors_raw = record.get("flavors", {})
+    flavors = flavors_raw if isinstance(flavors_raw, dict) else {}
+    flavor_names = ", ".join(sorted([str(key) for key in flavors.keys()])) if flavors else ""
+
+    model_class = ""
+    spark_flavor = flavors.get("spark")
+    if isinstance(spark_flavor, dict):
+        model_class = str(spark_flavor.get("model_class", "")).strip()
+
+    return {
+        "artifact_path": str(record.get("artifact_path", "")).strip(),
+        "created_utc": str(record.get("utc_time_created", "")).strip(),
+        "flavors": flavor_names,
+        "model_class": model_class,
+        "model_size_bytes": record.get("model_size_bytes", np.nan),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_mlflow_tracking_data(mlruns_root: str) -> Dict[str, pd.DataFrame]:
+    run_rows: List[Dict[str, object]] = []
+    param_rows: List[Dict[str, object]] = []
+    metric_rows: List[Dict[str, object]] = []
+    tag_rows: List[Dict[str, object]] = []
+    model_artifact_rows: List[Dict[str, object]] = []
+
+    root = Path(mlruns_root)
+    if not root.exists() or not root.is_dir():
+        return {
+            "runs": pd.DataFrame(),
+            "params": pd.DataFrame(),
+            "metrics": pd.DataFrame(),
+            "tags": pd.DataFrame(),
+            "model_artifacts": pd.DataFrame(),
+        }
+
+    ignored_dirs = {".trash", "models"}
+    status_map = {
+        "1": "RUNNING",
+        "2": "SCHEDULED",
+        "3": "FINISHED",
+        "4": "FAILED",
+        "5": "KILLED",
+    }
+
+    for experiment_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not experiment_dir.is_dir() or experiment_dir.name in ignored_dirs:
+            continue
+
+        exp_meta = parse_simple_meta_yaml(experiment_dir / "meta.yaml")
+        experiment_id = exp_meta.get("experiment_id", experiment_dir.name)
+        experiment_name = exp_meta.get("name", experiment_dir.name)
+
+        for run_dir in sorted(experiment_dir.iterdir(), key=lambda p: p.name):
+            if not run_dir.is_dir() or run_dir.name.startswith("."):
+                continue
+
+            run_meta_file = run_dir / "meta.yaml"
+            if not run_meta_file.exists():
+                continue
+
+            run_meta = parse_simple_meta_yaml(run_meta_file)
+            run_id = str(run_meta.get("run_id", run_meta.get("run_uuid", run_dir.name))).strip()
+            run_name = str(run_meta.get("run_name", "")).strip() or run_id[:8]
+
+            raw_status = str(run_meta.get("status", "")).strip()
+            status = status_map.get(raw_status, raw_status or "UNKNOWN")
+
+            try:
+                start_time = pd.to_datetime(int(float(run_meta.get("start_time", ""))), unit="ms", errors="coerce")
+            except (TypeError, ValueError):
+                start_time = pd.NaT
+
+            try:
+                end_time = pd.to_datetime(int(float(run_meta.get("end_time", ""))), unit="ms", errors="coerce")
+            except (TypeError, ValueError):
+                end_time = pd.NaT
+
+            if pd.notna(start_time) and pd.notna(end_time):
+                duration_seconds: Optional[float] = max((end_time - start_time).total_seconds(), 0.0)
+            else:
+                duration_seconds = None
+
+            params = load_mlflow_text_directory(run_dir / "params")
+            tags = load_mlflow_text_directory(run_dir / "tags")
+
+            metrics: Dict[str, float] = {}
+            metrics_dir = run_dir / "metrics"
+            if metrics_dir.exists() and metrics_dir.is_dir():
+                for metric_file in sorted(metrics_dir.iterdir(), key=lambda p: p.name):
+                    if not metric_file.is_file():
+                        continue
+                    metric_value, metric_step, metric_timestamp = parse_mlflow_metric_file(metric_file)
+                    if metric_value is None:
+                        continue
+                    metrics[metric_file.name] = metric_value
+                    metric_rows.append(
+                        {
+                            "experiment_id": experiment_id,
+                            "experiment_name": experiment_name,
+                            "run_id": run_id,
+                            "run_name": run_name,
+                            "model_name": params.get("model_name", run_name),
+                            "metric": metric_file.name,
+                            "value": metric_value,
+                            "step": metric_step,
+                            "timestamp": metric_timestamp,
+                        }
+                    )
+
+            for key, value in params.items():
+                param_rows.append(
+                    {
+                        "experiment_id": experiment_id,
+                        "experiment_name": experiment_name,
+                        "run_id": run_id,
+                        "run_name": run_name,
+                        "model_name": params.get("model_name", run_name),
+                        "key": key,
+                        "value": value,
+                    }
+                )
+
+            for key, value in tags.items():
+                tag_rows.append(
+                    {
+                        "experiment_id": experiment_id,
+                        "experiment_name": experiment_name,
+                        "run_id": run_id,
+                        "run_name": run_name,
+                        "model_name": params.get("model_name", run_name),
+                        "key": key,
+                        "value": value,
+                    }
+                )
+
+            model_info = parse_mlflow_model_history_tag(tags.get("mlflow.log-model.history", ""))
+            has_model_artifact = bool(model_info)
+            if not has_model_artifact:
+                has_model_artifact = (run_dir / "artifacts" / "model" / "MLmodel").exists()
+
+            if has_model_artifact:
+                model_artifact_rows.append(
+                    {
+                        "experiment_id": experiment_id,
+                        "experiment_name": experiment_name,
+                        "run_id": run_id,
+                        "run_name": run_name,
+                        "model_name": params.get("model_name", run_name),
+                        "artifact_path": model_info.get("artifact_path", "model"),
+                        "created_utc": model_info.get("created_utc", ""),
+                        "flavors": model_info.get("flavors", ""),
+                        "model_class": model_info.get("model_class", ""),
+                        "model_size_bytes": model_info.get("model_size_bytes", np.nan),
+                    }
+                )
+
+            model_name = str(params.get("model_name", run_name)).strip() or run_name
+            has_params = len(params) > 0
+            has_metrics = len(metrics) > 0
+            fully_logged = has_params and has_metrics and has_model_artifact
+
+            run_rows.append(
+                {
+                    "experiment_id": experiment_id,
+                    "experiment_name": experiment_name,
+                    "run_id": run_id,
+                    "run_name": run_name,
+                    "model_name": model_name,
+                    "status": status,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration_seconds": duration_seconds,
+                    "has_params": has_params,
+                    "has_metrics": has_metrics,
+                    "has_model_artifact": has_model_artifact,
+                    "fully_logged": fully_logged,
+                    "accuracy": metrics.get("accuracy", np.nan),
+                    "f1": metrics.get("f1", np.nan),
+                    "precision": metrics.get("precision", np.nan),
+                    "recall": metrics.get("recall", np.nan),
+                    "auc": metrics.get("auc", np.nan),
+                    "param_count": len(params),
+                    "metric_count": len(metrics),
+                }
+            )
+
+    runs_df = pd.DataFrame(run_rows)
+    if not runs_df.empty:
+        runs_df = runs_df.sort_values("start_time", ascending=False, na_position="last")
+
+    params_df = pd.DataFrame(param_rows)
+    metrics_df = pd.DataFrame(metric_rows)
+    tags_df = pd.DataFrame(tag_rows)
+    model_artifacts_df = pd.DataFrame(model_artifact_rows)
+
+    return {
+        "runs": runs_df,
+        "params": params_df,
+        "metrics": metrics_df,
+        "tags": tags_df,
+        "model_artifacts": model_artifacts_df,
+    }
+
+
+def build_feature_importance_data(
+    prepared: Dict[str, pd.DataFrame],
+    selected_models: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    fi_all = prepared.get("feature_importance_all_models", pd.DataFrame()).copy()
+
+    model_list = (
+        prepared["model_comparison"]["model"].dropna().astype(str).drop_duplicates().tolist()
+        if "model_comparison" in prepared and "model" in prepared["model_comparison"].columns
+        else []
+    )
+    if not model_list and not fi_all.empty and "model" in fi_all.columns:
+        model_list = sorted(fi_all["model"].dropna().astype(str).unique().tolist())
+
+    if selected_models:
+        selected_set = set(selected_models)
+        model_list = [model for model in model_list if model in selected_set]
+
+    importance_rows: List[Dict[str, object]] = []
+    coverage_rows: List[Dict[str, object]] = []
+
+    for model_name in model_list:
+        source_df = fi_all.loc[fi_all["model"] == model_name].copy() if not fi_all.empty else pd.DataFrame()
+
+        if source_df.empty or "feature" not in source_df.columns or "importance" not in source_df.columns:
+            coverage_rows.append(
+                {
+                    "model": model_name,
+                    "importance_available": False,
+                    "feature_count": 0,
+                    "top_feature": "N/A",
+                    "top_importance": np.nan,
+                }
+            )
+            continue
+
+        fi_df = source_df[["feature", "importance"]].copy()
+        fi_df["importance"] = pd.to_numeric(fi_df["importance"], errors="coerce")
+        fi_df = fi_df.dropna(subset=["feature", "importance"])
+
+        if fi_df.empty:
+            coverage_rows.append(
+                {
+                    "model": model_name,
+                    "importance_available": False,
+                    "feature_count": 0,
+                    "top_feature": "N/A",
+                    "top_importance": np.nan,
+                }
+            )
+            continue
+
+        fi_df = fi_df.sort_values("importance", ascending=False).reset_index(drop=True)
+        importance_sum = float(fi_df["importance"].sum())
+        fi_df["importance_norm"] = fi_df["importance"] / importance_sum if importance_sum > 0 else 0.0
+        fi_df["model"] = model_name
+        fi_df["rank"] = np.arange(1, len(fi_df) + 1)
+
+        top_row = fi_df.iloc[0]
+        coverage_rows.append(
+            {
+                "model": model_name,
+                "importance_available": True,
+                "feature_count": int(len(fi_df)),
+                "top_feature": str(top_row["feature"]),
+                "top_importance": float(top_row["importance"]),
+            }
+        )
+
+        importance_rows.extend(fi_df.to_dict("records"))
+
+    importance_long = pd.DataFrame(importance_rows)
+    coverage_df = pd.DataFrame(coverage_rows)
+    return importance_long, coverage_df
 
 
 def clip_series(series: pd.Series, q_low: float = 0.01, q_high: float = 0.99) -> pd.Series:
@@ -986,47 +1487,55 @@ def render_ml_dashboard(
 
     with row2_col1:
         st.subheader("Feature Importance (Horizontal Bar Chart)")
-        feature_source_options = ["GBTClassifier", "RandomForestClassifier"]
-        valid_options = [model for model in feature_source_options if (not selected_models) or (model in selected_models)]
-        if not valid_options:
-            valid_options = feature_source_options
+        fi_all = prepared.get("feature_importance_all_models", pd.DataFrame()).copy()
+        if selected_models:
+            fi_all = fi_all.loc[fi_all["model"].isin(selected_models)]
 
-        selected_importance_model = st.selectbox(
-            "Feature Importance Model",
-            options=valid_options,
-            index=0,
-            key="feature_importance_model_select",
-        )
+        available_models = sorted(fi_all["model"].dropna().astype(str).unique().tolist()) if not fi_all.empty else []
 
-        top_n_features = st.slider(
-            "Gösterilecek özellik sayısı",
-            min_value=5,
-            max_value=25,
-            value=15,
-            step=1,
-            key="feature_importance_top_n",
-        )
+        if not available_models:
+            st.info("Seçili model filtresinde feature importance verisi bulunamadı.")
+        else:
+            selected_importance_model = st.selectbox(
+                "Feature Importance Model",
+                options=available_models,
+                index=0,
+                key="feature_importance_model_select",
+            )
 
-        fi_df = (
-            prepared["feature_importance_gbt"].copy()
-            if selected_importance_model == "GBTClassifier"
-            else prepared["feature_importance_rf"].copy()
-        )
-        fi_df = fi_df.sort_values("importance", ascending=False).head(top_n_features).sort_values("importance", ascending=True)
+            model_feature_count = int(fi_all.loc[fi_all["model"] == selected_importance_model, "feature"].nunique())
+            min_features = 1 if model_feature_count < 5 else 5
+            max_features = max(min_features, min(40, model_feature_count))
 
-        fi_fig = px.bar(
-            fi_df,
-            x="importance",
-            y="feature",
-            orientation="h",
-            color="importance",
-            color_continuous_scale=[theme["accent_blue"], theme["risk_red"]],
-        )
-        fi_fig.update_traces(hovertemplate="Feature=%{y}<br>Importance=%{x:.4f}<extra></extra>")
-        style_figure(fi_fig, theme, height=420)
-        st.plotly_chart(fi_fig, use_container_width=True, config={"displaylogo": False})
-        st.markdown('<div class="insight-mini">Faiz ve borçlulukla ilişkili değişkenler modelin tahmin gücünde en yüksek paya sahip.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="insight-mini" style="margin-top:-0.65rem;"><strong>Eksen açıklaması:</strong> X ekseni özellik önem skorunu (importance), Y ekseni modelde kullanılan özellik adlarını gösterir.</div>', unsafe_allow_html=True)
+            top_n_features = st.slider(
+                "Gösterilecek özellik sayısı",
+                min_value=min_features,
+                max_value=max_features,
+                value=min(15, max_features),
+                step=1,
+                key="feature_importance_top_n",
+            )
+
+            fi_df = (
+                fi_all.loc[fi_all["model"] == selected_importance_model]
+                .sort_values("importance", ascending=False)
+                .head(top_n_features)
+                .sort_values("importance", ascending=True)
+            )
+
+            fi_fig = px.bar(
+                fi_df,
+                x="importance",
+                y="feature",
+                orientation="h",
+                color="importance_norm",
+                color_continuous_scale=[theme["accent_blue"], theme["risk_red"]],
+            )
+            fi_fig.update_traces(hovertemplate="Feature=%{y}<br>Importance=%{x:.4f}<extra></extra>")
+            style_figure(fi_fig, theme, height=420)
+            st.plotly_chart(fi_fig, use_container_width=True, config={"displaylogo": False})
+            st.markdown('<div class="insight-mini">Model bazında en etkili değişkenler, tahmin davranışının açıklanabilirliğini güçlendirir.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="insight-mini" style="margin-top:-0.65rem;"><strong>Eksen açıklaması:</strong> X ekseni özellik önem skorunu (importance), Y ekseni modelde kullanılan özellik adlarını gösterir.</div>', unsafe_allow_html=True)
 
     with row2_col2:
         st.subheader("ROC Curve")
@@ -1105,6 +1614,349 @@ def render_ml_dashboard(
             height=340,
         )
         st.markdown('<div class="insight-mini">Etkileşimli tablo, sunum sırasında metrik bazında detaylı inceleme yapılmasını destekler.</div>', unsafe_allow_html=True)
+
+
+def render_model_governance_dashboard(
+    prepared: Dict[str, pd.DataFrame],
+    project_root: Path,
+    selected_models: List[str],
+    theme: Dict[str, str],
+) -> None:
+    st.markdown('<div class="main-title">Model Governance Dashboard</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="main-subtitle">Zorunlu kontroller: tüm modeller için feature importance kapsamı ve MLflow log tamlık denetimi.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Feature Importance Coverage")
+    importance_long, coverage_df = build_feature_importance_data(prepared, selected_models)
+
+    if coverage_df.empty:
+        st.warning("Model listesi bulunamadı. Feature importance kapsamı doğrulanamıyor.")
+    else:
+        total_models = int(len(coverage_df))
+        logged_models = int(coverage_df["importance_available"].sum())
+        coverage_ratio = (logged_models / total_models) if total_models > 0 else 0.0
+
+        fi_col1, fi_col2, fi_col3 = st.columns(3, gap="medium")
+        fi_col1.metric("Toplam Model", total_models)
+        fi_col2.metric("Importance Loglu Model", logged_models)
+        fi_col3.metric("Kapsam Oranı", f"{coverage_ratio:.1%}")
+
+        coverage_view = coverage_df.copy().sort_values(["importance_available", "model"], ascending=[False, True])
+        coverage_view["importance_available"] = np.where(coverage_view["importance_available"], "Yes", "No")
+
+        st.dataframe(
+            coverage_view.style.format({"top_importance": "{:.4f}"}),
+            use_container_width=True,
+            height=220,
+        )
+
+        missing_importance = coverage_df.loc[~coverage_df["importance_available"], "model"].tolist()
+        if missing_importance:
+            st.warning(f"Feature importance logu olmayan modeller: {', '.join(missing_importance)}")
+        else:
+            st.success("Seçili modellerin tamamı için feature importance logu mevcut.")
+
+    if not importance_long.empty:
+        global_feature_cap = int(min(30, max(5, importance_long["feature"].nunique())))
+        global_top_n = st.slider(
+            "Global Top Özellik Sayısı",
+            min_value=5,
+            max_value=global_feature_cap,
+            value=min(12, global_feature_cap),
+            step=1,
+            key="gov_global_feature_count",
+        )
+
+        global_top = (
+            importance_long.groupby("feature", as_index=False)["importance_norm"]
+            .mean()
+            .sort_values("importance_norm", ascending=False)
+            .head(global_top_n)
+        )
+
+        compare_col1, compare_col2 = st.columns([1.2, 1.0], gap="large")
+
+        with compare_col1:
+            st.subheader("Cross-Model Feature Importance Heatmap")
+            feature_order = global_top["feature"].tolist()
+            heatmap_df = (
+                importance_long.loc[importance_long["feature"].isin(feature_order)]
+                .pivot_table(index="feature", columns="model", values="importance_norm", aggfunc="mean", fill_value=0.0)
+                .reindex(index=list(reversed(feature_order)))
+            )
+
+            if not heatmap_df.empty:
+                model_order = coverage_df["model"].tolist() if not coverage_df.empty else heatmap_df.columns.tolist()
+                model_order = [model for model in model_order if model in heatmap_df.columns]
+                heatmap_df = heatmap_df.reindex(columns=model_order)
+
+                fig_heat = go.Figure(
+                    data=go.Heatmap(
+                        z=heatmap_df.values,
+                        x=heatmap_df.columns,
+                        y=heatmap_df.index,
+                        colorscale=[
+                            [0.0, hex_to_rgba(theme["accent_blue"], 0.2)],
+                            [0.6, theme["accent_blue"]],
+                            [1.0, theme["risk_red"]],
+                        ],
+                        colorbar=dict(title="Normalized"),
+                        hovertemplate="Feature=%{y}<br>Model=%{x}<br>Norm Importance=%{z:.4f}<extra></extra>",
+                    )
+                )
+                style_figure(fig_heat, theme, height=430)
+                st.plotly_chart(fig_heat, use_container_width=True, config={"displaylogo": False})
+                st.markdown(
+                    '<div class="insight-mini">Heatmap, hangi özelliklerin birden fazla modelde baskın sinyal ürettiğini gösterir.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info("Heatmap üretimi için uygun feature importance verisi bulunamadı.")
+
+        with compare_col2:
+            st.subheader("Model Bazlı Top Features")
+            model_options = sorted(importance_long["model"].dropna().astype(str).unique().tolist())
+            selected_importance_model = st.selectbox(
+                "Model",
+                options=model_options,
+                key="gov_feature_model_select",
+            )
+
+            model_feature_count = int(
+                importance_long.loc[importance_long["model"] == selected_importance_model, "feature"].nunique()
+            )
+            model_feature_slider_max = max(5, min(40, model_feature_count))
+            model_top_n = st.slider(
+                "Gösterilecek özellik sayısı",
+                min_value=5,
+                max_value=model_feature_slider_max,
+                value=min(15, model_feature_slider_max),
+                step=1,
+                key="gov_feature_top_n",
+            )
+
+            model_importance = (
+                importance_long.loc[importance_long["model"] == selected_importance_model]
+                .sort_values("importance", ascending=False)
+                .head(model_top_n)
+                .sort_values("importance", ascending=True)
+            )
+
+            fig_model = px.bar(
+                model_importance,
+                x="importance",
+                y="feature",
+                orientation="h",
+                color="importance_norm",
+                color_continuous_scale=[theme["accent_blue"], theme["risk_red"]],
+            )
+            fig_model.update_traces(hovertemplate="Feature=%{y}<br>Importance=%{x:.4f}<extra></extra>")
+            style_figure(fig_model, theme, height=430)
+            st.plotly_chart(fig_model, use_container_width=True, config={"displaylogo": False})
+            st.markdown(
+                '<div class="insight-mini"><strong>Eksen açıklaması:</strong> X ekseni importance skorunu, Y ekseni özellik adlarını gösterir.</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("---")
+    st.subheader("MLflow Logging Compliance")
+
+    tracking_data = load_mlflow_tracking_data(str(project_root / "mlruns"))
+    runs_df = tracking_data["runs"].copy()
+
+    if runs_df.empty:
+        st.warning("MLflow run kaydı bulunamadı. mlruns klasörü kontrol edilmelidir.")
+        return
+
+    if selected_models:
+        selected_set = set(selected_models)
+        runs_df = runs_df.loc[
+            runs_df["model_name"].isin(selected_set) | runs_df["run_name"].isin(selected_set)
+        ]
+
+    if runs_df.empty:
+        st.info("Seçili model filtresine uygun MLflow run kaydı yok.")
+        return
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3, gap="medium")
+
+    experiment_options = sorted(runs_df["experiment_name"].dropna().astype(str).unique().tolist())
+    selected_experiments = filter_col1.multiselect(
+        "Experiment Filter",
+        options=experiment_options,
+        default=experiment_options,
+        key="gov_mlflow_experiment_filter",
+    )
+
+    status_options = sorted(runs_df["status"].dropna().astype(str).unique().tolist())
+    selected_statuses = filter_col2.multiselect(
+        "Status Filter",
+        options=status_options,
+        default=status_options,
+        key="gov_mlflow_status_filter",
+    )
+
+    only_incomplete = filter_col3.toggle(
+        "Sadece eksik logları göster",
+        value=False,
+        key="gov_mlflow_only_incomplete",
+    )
+
+    if selected_experiments:
+        runs_df = runs_df.loc[runs_df["experiment_name"].isin(selected_experiments)]
+    if selected_statuses:
+        runs_df = runs_df.loc[runs_df["status"].isin(selected_statuses)]
+    if only_incomplete:
+        runs_df = runs_df.loc[~runs_df["fully_logged"]]
+
+    if runs_df.empty:
+        st.info("Seçilen filtrelerle gösterilecek MLflow run bulunamadı.")
+        return
+
+    total_runs = int(len(runs_df))
+    fully_logged_runs = int(runs_df["fully_logged"].sum())
+    compliance_ratio = (fully_logged_runs / total_runs) if total_runs > 0 else 0.0
+    unique_experiments = int(runs_df["experiment_id"].nunique())
+
+    ml_col1, ml_col2, ml_col3, ml_col4 = st.columns(4, gap="medium")
+    ml_col1.metric("Toplam Run", total_runs)
+    ml_col2.metric("Tam Loglanan Run", fully_logged_runs)
+    ml_col3.metric("Uygunluk", f"{compliance_ratio:.1%}")
+    ml_col4.metric("Experiment Sayısı", unique_experiments)
+
+    compliance_by_model = (
+        runs_df.groupby("model_name", as_index=False)
+        .agg(run_count=("run_id", "count"), compliance_rate=("fully_logged", "mean"))
+        .sort_values("compliance_rate", ascending=False)
+    )
+    compliance_by_model["compliance_pct"] = compliance_by_model["compliance_rate"] * 100.0
+
+    fig_compliance = px.bar(
+        compliance_by_model,
+        x="model_name",
+        y="compliance_pct",
+        color="compliance_pct",
+        color_continuous_scale=[theme["risk_red"], theme["warning_orange"], theme["success_green"]],
+        hover_data={"run_count": True},
+    )
+    fig_compliance.update_traces(
+        hovertemplate="Model=%{x}<br>Compliance=%{y:.1f}%<br>Run Count=%{customdata[0]}<extra></extra>"
+    )
+    fig_compliance.update_yaxes(title_text="Compliance %", range=[0, 100])
+    style_figure(fig_compliance, theme, height=360)
+    st.plotly_chart(fig_compliance, use_container_width=True, config={"displaylogo": False})
+
+    runs_view = runs_df.copy().sort_values("start_time", ascending=False)
+    runs_view["start_time"] = pd.to_datetime(runs_view["start_time"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    runs_view["start_time"] = runs_view["start_time"].fillna("N/A")
+    runs_view["fully_logged"] = np.where(runs_view["fully_logged"], "Yes", "No")
+
+    display_columns = [
+        "experiment_name",
+        "model_name",
+        "run_name",
+        "status",
+        "fully_logged",
+        "has_params",
+        "has_metrics",
+        "has_model_artifact",
+        "accuracy",
+        "f1",
+        "precision",
+        "recall",
+        "auc",
+        "start_time",
+        "run_id",
+    ]
+    st.dataframe(
+        runs_view[display_columns].style.format(
+            {
+                "accuracy": "{:.4f}",
+                "f1": "{:.4f}",
+                "precision": "{:.4f}",
+                "recall": "{:.4f}",
+                "auc": "{:.4f}",
+            }
+        ),
+        use_container_width=True,
+        height=330,
+    )
+
+    run_lookup = runs_df.set_index("run_id")[["model_name", "status"]].to_dict("index")
+    run_ids = runs_df["run_id"].dropna().astype(str).tolist()
+
+    selected_run_id = st.selectbox(
+        "Run Detay İncelemesi",
+        options=run_ids,
+        format_func=lambda rid: f"{rid[:8]} | {run_lookup[rid]['model_name']} | {run_lookup[rid]['status']}",
+        key="gov_mlflow_run_detail_select",
+    )
+
+    run_row = runs_df.loc[runs_df["run_id"] == selected_run_id].iloc[0]
+    missing_items = []
+    if not bool(run_row["has_params"]):
+        missing_items.append("parameters")
+    if not bool(run_row["has_metrics"]):
+        missing_items.append("metrics")
+    if not bool(run_row["has_model_artifact"]):
+        missing_items.append("model")
+
+    if missing_items:
+        st.error(f"Seçili run için eksik zorunlu log alanları: {', '.join(missing_items)}")
+    else:
+        st.success("Seçili run, zorunlu MLflow log alanlarının tamamını içeriyor.")
+
+    detail_col1, detail_col2 = st.columns(2, gap="large")
+
+    with detail_col1:
+        st.markdown("**Run Parameters**")
+        params_df = tracking_data["params"].copy()
+        run_params = params_df.loc[params_df["run_id"] == selected_run_id, ["key", "value"]]
+        if run_params.empty:
+            st.info("Parameter logu bulunamadı.")
+        else:
+            st.dataframe(run_params.sort_values("key"), use_container_width=True, height=260)
+
+    with detail_col2:
+        st.markdown("**Run Metrics**")
+        metrics_df = tracking_data["metrics"].copy()
+        run_metrics = metrics_df.loc[metrics_df["run_id"] == selected_run_id, ["metric", "value", "step", "timestamp"]]
+        if run_metrics.empty:
+            st.info("Metric logu bulunamadı.")
+        else:
+            run_metrics = run_metrics.sort_values("metric")
+            run_metrics["timestamp"] = pd.to_datetime(run_metrics["timestamp"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            run_metrics["timestamp"] = run_metrics["timestamp"].fillna("N/A")
+            st.dataframe(
+                run_metrics.style.format({"value": "{:.6f}"}),
+                use_container_width=True,
+                height=260,
+            )
+
+    artifact_df = tracking_data["model_artifacts"].copy()
+    run_artifact = artifact_df.loc[
+        artifact_df["run_id"] == selected_run_id,
+        ["artifact_path", "flavors", "model_class", "created_utc", "model_size_bytes"],
+    ]
+    st.markdown("**Model Artifact**")
+    if run_artifact.empty:
+        st.info("Model artifact logu bulunamadı.")
+    else:
+        st.dataframe(
+            run_artifact.style.format({"model_size_bytes": "{:.0f}"}),
+            use_container_width=True,
+            height=120,
+        )
+
+    with st.expander("Run Tags"):
+        tags_df = tracking_data["tags"].copy()
+        run_tags = tags_df.loc[tags_df["run_id"] == selected_run_id, ["key", "value"]]
+        if run_tags.empty:
+            st.info("Tag kaydı bulunamadı.")
+        else:
+            st.dataframe(run_tags.sort_values("key"), use_container_width=True, height=220)
 
 
 def render_threshold_dashboard(
@@ -1372,6 +2224,7 @@ def main() -> None:
             "Executive Overview",
             "EDA Dashboard",
             "Machine Learning Dashboard",
+            "Model Governance Dashboard",
             "Threshold & Business Strategy Dashboard",
         ],
     )
@@ -1422,6 +2275,8 @@ def main() -> None:
         render_eda_dashboard(prepared, raw_eda, monthly_filtered, theme)
     elif page == "Machine Learning Dashboard":
         render_ml_dashboard(prepared, selected_models, kpi_map, theme)
+    elif page == "Model Governance Dashboard":
+        render_model_governance_dashboard(prepared, project_root, selected_models, theme)
     else:
         render_threshold_dashboard(prepared, kpi_map, selected_models, selected_threshold, theme)
 
